@@ -26,6 +26,8 @@ import org.junit.jupiter.api.condition.DisabledOnOs;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 
+import org.springframework.ai.tool.annotation.Tool;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -487,7 +489,7 @@ class ShellToolsTest {
 			String result = shellTools.bash("echo 'Test'", null, null, null);
 
 			String shellId = extractShellId(result);
-			assertThat(shellId).matches("shell_\\d+");
+			assertThat(shellId).matches("shell_run_\\d+");
 		}
 
 	}
@@ -496,12 +498,30 @@ class ShellToolsTest {
 	 * Helper method to extract shell_id from command output
 	 */
 	private String extractShellId(String output) {
-		Pattern pattern = Pattern.compile("bash_id: (shell_\\d+)");
+		Pattern pattern = Pattern.compile("bash_id: (shell_(?:run_)?\\d+)");
 		Matcher matcher = pattern.matcher(output);
 		if (matcher.find()) {
 			return matcher.group(1);
 		}
 		return null;
+	}
+
+	@Nested
+	@DisplayName("Tool Description Tests")
+	class ToolDescriptionTests {
+
+		@Test
+		@DisplayName("Should not instruct the model to add Claude Code attribution to commits or PRs")
+		void shouldNotInstructClaudeAttribution() throws NoSuchMethodException {
+			String description = ShellTools.class
+				.getMethod("bash", String.class, Long.class, String.class, Boolean.class)
+				.getAnnotation(Tool.class)
+				.description();
+
+			assertThat(description).contains("git commit -m", "gh pr create");
+			assertThat(description).doesNotContain("Claude Code", "Co-Authored-By", "noreply@anthropic.com");
+		}
+
 	}
 
 }

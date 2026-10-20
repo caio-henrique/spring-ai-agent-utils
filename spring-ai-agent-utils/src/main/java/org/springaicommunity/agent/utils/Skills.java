@@ -15,7 +15,6 @@
 */
 package org.springaicommunity.agent.utils;
 
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.JarURLConnection;
@@ -34,6 +33,7 @@ import java.util.stream.Stream;
 import org.springaicommunity.agent.tools.SkillsTool.Skill;
 
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.core.io.support.ResourcePatternResolver;
@@ -72,6 +72,18 @@ public class Skills {
 		List<Skill> skills = new ArrayList<>();
 
 		for (Resource skillsResource : skillsResources) {
+			// A classpath location can be contributed by several classpath entries (the
+			// application's own classes directory and any number of JARs). Resolving it
+			// via getFile()/getURL() would only see the first one, so scan them all.
+			if (skillsResource instanceof ClassPathResource classPathResource) {
+				try {
+					skills.addAll(loadFromClasspath(classPathResource.getPath(), classPathResource.getClassLoader()));
+				}
+				catch (IOException ex) {
+					throw new RuntimeException("Failed to load skills from resource: " + skillsResource, ex);
+				}
+				continue;
+			}
 			try {
 				String path = skillsResource.getFile().toPath().toAbsolutePath().toString();
 				skills.addAll(loadDirectory(path));
@@ -142,32 +154,19 @@ public class Skills {
 	}
 
 	/**
-	 * Loads skills from a non-filesystem resource. Handles two cases:
-	 * <ul>
-	 * <li>Resources with resolvable {@code jar:} URLs (e.g.,
-	 * {@link org.springframework.core.io.UrlResource}) — uses
-	 * {@link JarURLConnection}</li>
-	 * <li>{@link ClassPathResource} where the directory lacks an explicit JAR entry —
-	 * uses Spring's {@link ResourcePatternResolver} with a manual JAR scan fallback</li>
-	 * </ul>
+	 * Loads skills from a non-filesystem resource with a resolvable {@code jar:} URL (e.g.,
+	 * {@link org.springframework.core.io.UrlResource}). Such a resource refers to one
+	 * specific, unambiguous JAR, so a direct {@link JarURLConnection} scan is correct.
+	 * {@link ClassPathResource}s never reach this method: they are resolved via
+	 * {@link #loadFromClasspath}, which scans every matching classpath entry, because
+	 * {@code ClassPathResource.getURL()} resolves through
+	 * {@code ClassLoader.getResource()} (singular) and only ever sees the first one.
 	 * @param resource the resource pointing to a skills directory
 	 * @return a list of Skill objects parsed from SKILL.md files
 	 * @throws IOException if an I/O error occurs while reading
 	 */
 	private static List<Skill> loadJarResource(Resource resource) throws IOException {
-		URL resourceUrl;
-		try {
-			resourceUrl = resource.getURL();
-		}
-		catch (FileNotFoundException ex) {
-			// ClassPathResource for a JAR directory without an explicit directory entry
-			// cannot resolve to a URL. Fall back to classpath scanning.
-			if (resource instanceof ClassPathResource classPathResource) {
-				return loadFromClasspath(classPathResource.getPath());
-			}
-			throw ex;
-		}
-
+		URL resourceUrl = resource.getURL();
 		String protocol = resourceUrl.getProtocol();
 
 		if (!"jar".equals(protocol)) {
@@ -189,20 +188,35 @@ public class Skills {
 	 * {@link PathMatchingResourcePatternResolver} — see Spring Framework issue #16711).
 	 * @param classpathPrefix the classpath prefix to scan (e.g.,
 	 * "META-INF/resources/skills")
+	 * @param classLoader the class loader to scan, or {@code null} for the default
 	 * @return a list of Skill objects parsed from discovered SKILL.md files
 	 * @throws IOException if an I/O error occurs during scanning or reading
 	 */
-	private static List<Skill> loadFromClasspath(String classpathPrefix) throws IOException {
+	private static List<Skill> loadFromClasspath(String classpathPrefix, ClassLoader classLoader)
+			throws IOException {
 		// Primary: Spring's ResourcePatternResolver — works for well-formed JARs with
 		// explicit directory entries and for resources on the filesystem.
-		ResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
+		ResourcePatternResolver resolver = new PathMatchingResourcePatternResolver(classLoader);
 		Resource[] resources = resolver.getResources("classpath*:" + classpathPrefix + "/**/SKILL.md");
 
 		if (resources.length > 0) {
 			List<Skill> skills = new ArrayList<>();
 			for (Resource skillResource : resources) {
 				try (InputStream is = skillResource.getInputStream()) {
-					String basePath = deriveBasePathFromUrl(skillResource.getURL());
+					// Filesystem entries get a plain directory path, as loadDirectory does,
+					// so the model can use it with the file and shell tools. Path-based, so
+					// it also works on non-default file systems such as the resource: file
+					// system of a GraalVM native image, where getFile() is unsupported.
+					String basePath;
+					if (skillResource instanceof FileSystemResource fileSystemResource) {
+						basePath = fileSystemResource.getFilePath().toAbsolutePath().getParent().toString();
+					}
+					else if (skillResource.isFile()) {
+						basePath = skillResource.getFile().toPath().toAbsolutePath().getParent().toString();
+					}
+					else {
+						basePath = deriveBasePathFromUrl(skillResource.getURL());
+					}
 					skills.add(parseSkill(is, basePath));
 				}
 			}
@@ -212,7 +226,7 @@ public class Skills {
 		// Fallback: Manual JAR scanning for JARs without directory entries.
 		// Uses the same strategy as Spring's own
 		// PathMatchingResourcePatternResolver.addAllClassLoaderJarRoots().
-		return scanClasspathJarsForSkills(classpathPrefix);
+		return scanClasspathJarsForSkills(classpathPrefix, classLoader);
 	}
 
 	/**
@@ -220,10 +234,13 @@ public class Skills {
 	 * via {@code ClassLoader.getResources("META-INF/MANIFEST.MF")} — a technique used by
 	 * Spring internally when standard classpath resolution is insufficient.
 	 */
-	private static List<Skill> scanClasspathJarsForSkills(String classpathPrefix) throws IOException {
+	private static List<Skill> scanClasspathJarsForSkills(String classpathPrefix, ClassLoader classLoader)
+			throws IOException {
 		String prefix = classpathPrefix.endsWith("/") ? classpathPrefix : classpathPrefix + "/";
 
-		ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+		if (classLoader == null) {
+			classLoader = Thread.currentThread().getContextClassLoader();
+		}
 		if (classLoader == null) {
 			classLoader = Skills.class.getClassLoader();
 		}
